@@ -11,6 +11,7 @@ enum class TokenKind {
 
   // Keywords
   KwInt,
+  KwFloat,
   KwIf,
   KwElse,
   KwWhile,

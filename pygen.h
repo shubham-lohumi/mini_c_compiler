@@ -1,16 +1,22 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "ast.h"
+#include "codegen.h"
 
 class PyGen {
 public:
   std::string generate(const Program &p) {
+    // Reuse existing semantic checks so PyGen does not emit code for invalid ASTs.
+    CodeGen semanticChecker;
+    (void)semanticChecker.compile(p);
+
     out_.str("");
     out_.clear();
     indent_ = 0;
@@ -75,6 +81,18 @@ private:
       return;
     }
     if (const auto *es = dynamic_cast<const ExprStmt *>(&s)) {
+      if (const auto *pf = dynamic_cast<const PostfixExpr *>(es->expr.get())) {
+        if (const auto *vv = dynamic_cast<const VarExpr *>(pf->expr.get())) {
+          if (pf->op == PostOp::PostInc) {
+            emitLine(vv->name + " += 1");
+            return;
+          }
+          if (pf->op == PostOp::PostDec) {
+            emitLine(vv->name + " -= 1");
+            return;
+          }
+        }
+      }
       // Evaluate for side-effects; discard result.
       (void)evalExpr(*es->expr);
       return;
@@ -105,8 +123,7 @@ private:
       return;
     }
     if (const auto *ws = dynamic_cast<const WhileStmt *>(&s)) {
-      std::string c = evalExpr(*ws->cond);
-      emitLine("while (" + c + ") != 0:");
+      emitWhileHeader(*ws->cond);
       indent_++;
       genStmt(*ws->body);
       if (blockWasEmpty(*ws->body)) emitLine("pass");
@@ -114,14 +131,32 @@ private:
       return;
     }
     if (const auto *fs = dynamic_cast<const ForStmt *>(&s)) {
-      // Lower for(...) into init; while(cond){ body; post; }
+      if (std::optional<RangeForInfo> rf = matchRangeStyleFor(*fs)) {
+        const bool isStartZero = (rf->startInclusivePy == "0");
+        const bool isStepOne = (rf->stepPy == "1");
+        std::string rangeArgs;
+        if (isStartZero && isStepOne) {
+          rangeArgs = rf->stopExclusivePy;
+        } else if (isStepOne) {
+          rangeArgs = rf->startInclusivePy + ", " + rf->stopExclusivePy;
+        } else {
+          rangeArgs = rf->startInclusivePy + ", " + rf->stopExclusivePy + ", " + rf->stepPy;
+        }
+        emitLine("for " + rf->loopVar + " in range(" + rangeArgs + "):");
+        indent_++;
+        genStmt(*fs->body);
+        if (blockWasEmpty(*fs->body)) emitLine("pass");
+        indent_--;
+        return;
+      }
+
+      // Lower general for(...) into init; while(cond){ body; post; }
       if (fs->init) genStmt(*fs->init);
-      std::string cond = fs->cond ? evalExpr(*fs->cond) : "1";
-      emitLine("while (" + cond + ") != 0:");
+
+      emitForWhileHeader(fs->cond.get());
       indent_++;
       genStmt(*fs->body);
       if (fs->post) {
-        // post is an expression (often i++/i-- or assignment)
         (void)evalExpr(*fs->post);
       }
       if (blockWasEmpty(*fs->body) && !fs->post) emitLine("pass");
@@ -136,12 +171,274 @@ private:
     return false;
   }
 
+  struct RangeForInfo {
+    std::string loopVar;
+    std::string startInclusivePy;
+    std::string stopExclusivePy;
+    std::string stepPy; // may be "1" or "-1" or other int literal
+  };
+
+  static bool exprIsPure(const Expr &e) {
+    if (dynamic_cast<const NumberExpr *>(&e)) return true;
+    if (dynamic_cast<const VarExpr *>(&e)) return true;
+    if (const auto *u = dynamic_cast<const UnaryExpr *>(&e)) {
+      if (u->op == UnOp::PreInc || u->op == UnOp::PreDec) return false;
+      return exprIsPure(*u->expr);
+    }
+    if (dynamic_cast<const PostfixExpr *>(&e)) return false;
+    if (const auto *b = dynamic_cast<const BinaryExpr *>(&e)) {
+      if (b->op == BinOp::Assign) return false;
+      return exprIsPure(*b->lhs) && exprIsPure(*b->rhs);
+    }
+    return false;
+  }
+
+  static std::string pureScalarTruthyPy(const Expr &e) {
+    if (const auto *n = dynamic_cast<const NumberExpr *>(&e)) {
+      if (n->kind == TypeKind::Float) {
+        std::ostringstream ss;
+        ss << n->fValue;
+        return "(" + ss.str() + ")";
+      }
+      return std::to_string(n->iValue);
+    }
+    if (const auto *v = dynamic_cast<const VarExpr *>(&e)) return v->name;
+    if (const auto *u = dynamic_cast<const UnaryExpr *>(&e)) {
+      if (u->op == UnOp::Neg)
+        return "(-(" + pureScalarTruthyPy(*u->expr) + "))";
+      if (u->op == UnOp::Not)
+        return "(not (" + pureScalarTruthyPy(*u->expr) + "))";
+    }
+    if (const auto *b = dynamic_cast<const BinaryExpr *>(&e)) {
+      const std::string L = pureScalarTruthyPy(*b->lhs);
+      const std::string R = pureScalarTruthyPy(*b->rhs);
+      switch (b->op) {
+        case BinOp::Add: return "((" + L + ") + (" + R + "))";
+        case BinOp::Sub: return "((" + L + ") - (" + R + "))";
+        case BinOp::Mul: return "((" + L + ") * (" + R + "))";
+        case BinOp::Div: return "((" + L + ") // (" + R + "))";
+        case BinOp::Mod: return "((" + L + ") % (" + R + "))";
+        case BinOp::Lt: return "((" + L + ") < (" + R + "))";
+        case BinOp::Le: return "((" + L + ") <= (" + R + "))";
+        case BinOp::Gt: return "((" + L + ") > (" + R + "))";
+        case BinOp::Ge: return "((" + L + ") >= (" + R + "))";
+        case BinOp::Eq: return "((" + L + ") == (" + R + "))";
+        case BinOp::Ne: return "((" + L + ") != (" + R + "))";
+        case BinOp::And: return "((" + L + ") and (" + R + "))";
+        case BinOp::Or: return "((" + L + ") or (" + R + "))";
+        case BinOp::Assign: break;
+      }
+    }
+    throw std::runtime_error("PyGen: pureScalarTruthyPy: unexpected expr");
+  }
+
+  static std::string pureArithmeticPy(const Expr &e) {
+    if (const auto *n = dynamic_cast<const NumberExpr *>(&e)) {
+      if (n->kind == TypeKind::Float) {
+        std::ostringstream ss;
+        ss << n->fValue;
+        return ss.str();
+      }
+      return std::to_string(n->iValue);
+    }
+    if (const auto *v = dynamic_cast<const VarExpr *>(&e)) return v->name;
+    if (const auto *u = dynamic_cast<const UnaryExpr *>(&e)) {
+      if (u->op == UnOp::Neg)
+        return "(-(" + pureArithmeticPy(*u->expr) + "))";
+      if (u->op == UnOp::Not)
+        return "(1 if (" + pureScalarTruthyPy(*u->expr) + ") else 0)";
+    }
+    if (const auto *b = dynamic_cast<const BinaryExpr *>(&e)) {
+      const std::string L = pureArithmeticPy(*b->lhs);
+      const std::string R = pureArithmeticPy(*b->rhs);
+      switch (b->op) {
+        case BinOp::Add: return "((" + L + ") + (" + R + "))";
+        case BinOp::Sub: return "((" + L + ") - (" + R + "))";
+        case BinOp::Mul: return "((" + L + ") * (" + R + "))";
+        case BinOp::Div: return "((" + L + ") // (" + R + "))";
+        case BinOp::Mod: return "((" + L + ") % (" + R + "))";
+        case BinOp::Lt: return "(1 if (" + pureScalarTruthyPy(*b) + ") else 0)";
+        case BinOp::Le: return "(1 if (" + pureScalarTruthyPy(*b) + ") else 0)";
+        case BinOp::Gt: return "(1 if (" + pureScalarTruthyPy(*b) + ") else 0)";
+        case BinOp::Ge: return "(1 if (" + pureScalarTruthyPy(*b) + ") else 0)";
+        case BinOp::Eq: return "(1 if (" + pureScalarTruthyPy(*b) + ") else 0)";
+        case BinOp::Ne: return "(1 if (" + pureScalarTruthyPy(*b) + ") else 0)";
+        case BinOp::And: return "(1 if (" + pureScalarTruthyPy(*b) + ") else 0)";
+        case BinOp::Or: return "(1 if (" + pureScalarTruthyPy(*b) + ") else 0)";
+        case BinOp::Assign: break;
+      }
+    }
+    throw std::runtime_error("PyGen: pureArithmeticPy: unexpected expr");
+  }
+
+  static std::optional<std::int64_t> postConstStep(const Expr *post, const std::string &var) {
+    if (!post) return std::nullopt;
+
+    if (const auto *pf = dynamic_cast<const PostfixExpr *>(post)) {
+      const auto *v = dynamic_cast<const VarExpr *>(pf->expr.get());
+      if (!v || v->name != var) return std::nullopt;
+      if (pf->op == PostOp::PostInc) return 1;
+      if (pf->op == PostOp::PostDec) return -1;
+      return std::nullopt;
+    }
+
+    if (const auto *u = dynamic_cast<const UnaryExpr *>(post)) {
+      const auto *v = dynamic_cast<const VarExpr *>(u->expr.get());
+      if (!v || v->name != var) return std::nullopt;
+      if (u->op == UnOp::PreInc) return 1;
+      if (u->op == UnOp::PreDec) return -1;
+      return std::nullopt;
+    }
+
+    // i = i + k  OR  i = i - k   (k must be int literal)
+    if (const auto *as = dynamic_cast<const BinaryExpr *>(post)) {
+      if (as->op != BinOp::Assign) return std::nullopt;
+      const auto *lv = dynamic_cast<const VarExpr *>(as->lhs.get());
+      if (!lv || lv->name != var) return std::nullopt;
+
+      const auto *rhsBin = dynamic_cast<const BinaryExpr *>(as->rhs.get());
+      if (!rhsBin) return std::nullopt;
+      const auto *rhsLv = dynamic_cast<const VarExpr *>(rhsBin->lhs.get());
+      const auto *rhsK = dynamic_cast<const NumberExpr *>(rhsBin->rhs.get());
+      if (!rhsLv || rhsLv->name != var) return std::nullopt;
+      if (!rhsK || rhsK->kind != TypeKind::Int) return std::nullopt;
+
+      if (rhsBin->op == BinOp::Add) return rhsK->iValue;
+      if (rhsBin->op == BinOp::Sub) return -rhsK->iValue;
+      return std::nullopt;
+    }
+
+    return std::nullopt;
+  }
+
+  static std::optional<std::string> declIntStartPy(const DeclStmt *d, std::string *outName) {
+    if (!d || d->type != TypeKind::Int) return std::nullopt;
+    *outName = d->name;
+    if (!d->init) return std::string("0");
+    if (!exprIsPure(*d->init)) return std::nullopt;
+    return pureArithmeticPy(*d->init);
+  }
+
+  static std::optional<std::string> assignStartExprStmtPy(const Stmt *s, std::string *outName) {
+    const auto *es = dynamic_cast<const ExprStmt *>(s);
+    if (!es) return std::nullopt;
+    const auto *b = dynamic_cast<const BinaryExpr *>(es->expr.get());
+    if (!b || b->op != BinOp::Assign) return std::nullopt;
+    const auto *lv = dynamic_cast<const VarExpr *>(b->lhs.get());
+    if (!lv) return std::nullopt;
+    if (!exprIsPure(*b->rhs)) return std::nullopt;
+    *outName = lv->name;
+    return pureArithmeticPy(*b->rhs);
+  }
+
+  static std::optional<RangeForInfo> matchRangeStyleFor(const ForStmt &fs) {
+    if (!fs.cond || !fs.post || !exprIsPure(*fs.cond)) return std::nullopt;
+
+    std::string loopVar;
+    std::string startPy;
+
+    if (const auto *d = dynamic_cast<const DeclStmt *>(fs.init.get())) {
+      auto st = declIntStartPy(d, &loopVar);
+      if (!st) return std::nullopt;
+      startPy = std::move(*st);
+    } else if (fs.init) {
+      auto st = assignStartExprStmtPy(fs.init.get(), &loopVar);
+      if (!st) return std::nullopt;
+      startPy = std::move(*st);
+    } else {
+      return std::nullopt;
+    }
+
+    auto stepOpt = postConstStep(fs.post.get(), loopVar);
+    if (!stepOpt) return std::nullopt;
+    const std::int64_t step = *stepOpt;
+    if (step == 0) return std::nullopt;
+
+    const auto *rel = dynamic_cast<const BinaryExpr *>(fs.cond.get());
+    if (!rel) return std::nullopt;
+    const auto *cv = dynamic_cast<const VarExpr *>(rel->lhs.get());
+    if (!cv || cv->name != loopVar) return std::nullopt;
+
+    if (!exprIsPure(*rel->rhs)) return std::nullopt;
+    const std::string boundPy = pureArithmeticPy(*rel->rhs);
+
+    std::string stopPy;
+    if (step > 0) {
+      if (rel->op == BinOp::Lt) stopPy = boundPy;
+      else if (rel->op == BinOp::Le) stopPy = "((" + boundPy + ") + 1)";
+      else return std::nullopt;
+    } else {
+      if (rel->op == BinOp::Gt) stopPy = boundPy;
+      else if (rel->op == BinOp::Ge) stopPy = "((" + boundPy + ") - 1)";
+      else return std::nullopt;
+    }
+
+    return RangeForInfo{std::move(loopVar), std::move(startPy), std::move(stopPy), std::to_string(step)};
+  }
+
+  void emitWhileHeader(const Expr &cond) {
+    if (exprIsPure(cond)) {
+      emitLine("while " + stripOuterParens(pureScalarTruthyPy(cond)) + ":");
+      return;
+    }
+    emitLine("while True:");
+    indent_++;
+    std::string v = evalExpr(cond);
+    emitLine("if (" + v + ") == 0:");
+    indent_++;
+    emitLine("break");
+    indent_--;
+    indent_--;
+  }
+
+  void emitForWhileHeader(const Expr *cond) {
+    if (!cond) {
+      emitLine("while True:");
+      return;
+    }
+    if (exprIsPure(*cond)) {
+      emitLine("while " + stripOuterParens(pureScalarTruthyPy(*cond)) + ":");
+      return;
+    }
+    emitLine("while True:");
+    indent_++;
+    std::string v = evalExpr(*cond);
+    emitLine("if (" + v + ") == 0:");
+    indent_++;
+    emitLine("break");
+    indent_--;
+    indent_--;
+  }
+
+  static std::string stripOuterParens(std::string s) {
+    while (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
+      int depth = 0;
+      bool wrapsWhole = true;
+      for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '(') ++depth;
+        else if (s[i] == ')') --depth;
+        if (depth == 0 && i + 1 < s.size()) {
+          wrapsWhole = false;
+          break;
+        }
+      }
+      if (!wrapsWhole) break;
+      s = s.substr(1, s.size() - 2);
+    }
+    return s;
+  }
+
   // Evaluate expression and return a Python expression that holds the value.
   // If C semantics require side-effects (++, --, assignment-as-expression),
   // we lower them into statements and return a temp/variable name.
   std::string evalExpr(const Expr &e) {
     if (const auto *n = dynamic_cast<const NumberExpr *>(&e)) {
-      return std::to_string(n->value);
+      if (n->kind == TypeKind::Float) {
+        std::ostringstream ss;
+        ss << n->fValue;
+        return ss.str();
+      }
+      return std::to_string(n->iValue);
     }
     if (const auto *v = dynamic_cast<const VarExpr *>(&e)) {
       return v->name;
@@ -149,13 +446,13 @@ private:
     if (const auto *u = dynamic_cast<const UnaryExpr *>(&e)) {
       if (u->op == UnOp::PreInc) {
         const auto *vv = dynamic_cast<const VarExpr *>(u->expr.get());
-        if (!vv) throw std::runtime_error("PyGen: pre ++ requires variable");
+        if (!vv) throw std::runtime_error("PyGen: pre ++/-- requires variable");
         emitLine(vv->name + " += 1");
         return vv->name;
       }
       if (u->op == UnOp::PreDec) {
         const auto *vv = dynamic_cast<const VarExpr *>(u->expr.get());
-        if (!vv) throw std::runtime_error("PyGen: pre -- requires variable");
+        if (!vv) throw std::runtime_error("PyGen: pre ++/-- requires variable");
         emitLine(vv->name + " -= 1");
         return vv->name;
       }

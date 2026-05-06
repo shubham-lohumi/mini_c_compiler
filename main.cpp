@@ -1,4 +1,5 @@
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -48,14 +49,19 @@ int main() {
     Program prog = parser.parseProgram();
 
     PyGen pg;
-    std::cout << "========== Python (equivalent) ==========\n";
-    std::cout << pg.generate(prog);
-    std::cout << "========== Program output ==========\n";
-
+    std::string pyCode = pg.generate(prog);
+    std::ofstream pyOut("generated.py");
+    if (!pyOut) {
+      throw std::runtime_error("failed to open generated.py for writing");
+    }
+    pyOut << pyCode;
+    if (!pyOut) {
+      throw std::runtime_error("failed to write generated.py");
+    }
     CodeGen cg;
     auto out = cg.compile(prog);
 
-    VM vm(std::move(out.code), out.numSlots, std::move(out.strings));
+    VM vm(std::move(out.code), out.numSlots, std::move(out.strings), std::move(out.floatConsts));
     vm.run();
     return 0;
   } catch (const std::exception &e) {
@@ -66,4 +72,4 @@ int main() {
 
 
 //g++ -std=c++17 -O2 -Wall -Wextra -pedantic main.cpp -o mini_cc
-//./mini_cc x < test.c
+//Get-Content test.c | ./mini_cc

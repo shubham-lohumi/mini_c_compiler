@@ -16,6 +16,7 @@ public:
     std::vector<Instr> code;
     std::size_t numSlots = 0;
     std::vector<std::string> strings;
+    std::vector<double> floatConsts;
   };
 
   Result compile(const Program &p) {
@@ -23,11 +24,16 @@ public:
     for (const auto &s : p.stmts) genStmt(*s);
     exitScope();
     emit(OpCode::HALT);
-    return Result{std::move(code_), nextSlot_, std::move(strings_)};
+    return Result{std::move(code_), nextSlot_, std::move(strings_), std::move(floatConsts_)};
   }
 
 private:
   void emit(OpCode op, std::int64_t arg = 0) { code_.push_back(Instr{op, arg}); }
+
+  struct VarInfo {
+    std::int64_t slot = 0;
+    TypeKind type = TypeKind::Int;
+  };
 
   std::int64_t internString(const std::string &s) {
     auto it = strIndex_.find(s);
@@ -55,21 +61,37 @@ private:
     scopes_.pop_back();
   }
 
-  std::int64_t declareVar(const std::string &name) {
+  VarInfo declareVar(const std::string &name, TypeKind t, std::size_t pos) {
     if (scopes_.empty()) throw std::runtime_error("no scope");
     auto &m = scopes_.back();
-    if (m.find(name) != m.end()) throw std::runtime_error("redeclaration of variable: " + name);
-    std::int64_t slot = static_cast<std::int64_t>(nextSlot_++);
-    m[name] = slot;
-    return slot;
+    if (m.find(name) != m.end()) {
+      throw std::runtime_error("Semantic error at line " + std::to_string(pos) +
+                               ": redeclaration of variable '" + name + "'");
+    }
+    VarInfo vi;
+    vi.slot = static_cast<std::int64_t>(nextSlot_++);
+    vi.type = t;
+    m[name] = vi;
+    return vi;
   }
 
-  std::int64_t lookupVar(const std::string &name) {
+  VarInfo lookupVar(const std::string &name, std::size_t pos) {
     for (std::size_t i = scopes_.size(); i-- > 0;) {
       auto it = scopes_[i].find(name);
       if (it != scopes_[i].end()) return it->second;
     }
-    throw std::runtime_error("use of undeclared variable: " + name);
+    throw std::runtime_error("Semantic error at line " + std::to_string(pos) +
+                             ": use of undeclared variable '" + name + "'");
+  }
+
+  std::int64_t internFloat(double v) {
+    std::int64_t idx = static_cast<std::int64_t>(floatConsts_.size());
+    floatConsts_.push_back(v);
+    return idx;
+  }
+
+  [[noreturn]] static void typeError(std::size_t pos, const std::string &msg) {
+    throw std::runtime_error("Type error at line " + std::to_string(pos) + ": " + msg);
   }
 
   void genStmt(const Stmt &s) {
@@ -80,23 +102,28 @@ private:
       return;
     }
     if (const auto *d = dynamic_cast<const DeclStmt*>(&s)) {
-      std::int64_t slot = declareVar(d->name);
+      VarInfo vi = declareVar(d->name, d->type, d->pos);
       if (d->init) {
-        genExpr(*d->init);
-        emit(OpCode::STORE, slot);
+        TypeKind rhsT = genExpr(*d->init);
+        if (vi.type == TypeKind::Float && rhsT == TypeKind::Int) emit(OpCode::I2F);
+        if (vi.type == TypeKind::Int && rhsT == TypeKind::Float) {
+          typeError(d->pos, "cannot initialize int '" + d->name + "' with float expression");
+        }
+        emit(OpCode::STORE, vi.slot);
       } else {
-        emit(OpCode::PUSH_CONST, 0);
-        emit(OpCode::STORE, slot);
+        if (vi.type == TypeKind::Float) emit(OpCode::PUSH_FLOAT, internFloat(0.0));
+        else emit(OpCode::PUSH_INT, 0);
+        emit(OpCode::STORE, vi.slot);
       }
       return;
     }
     if (const auto *es = dynamic_cast<const ExprStmt*>(&s)) {
-      genExpr(*es->expr);
+      (void)genExpr(*es->expr);
       emit(OpCode::POP);
       return;
     }
     if (const auto *p = dynamic_cast<const PrintfStmt*>(&s)) {
-      genExpr(*p->expr);
+      (void)genExpr(*p->expr);
       emit(OpCode::PRINT);
       return;
     }
@@ -133,13 +160,13 @@ private:
       if (fs->init) genStmt(*fs->init);
 
       std::size_t condPos = code_.size();
-      if (fs->cond) genExpr(*fs->cond);
-      else emit(OpCode::PUSH_CONST, 1);
+    if (fs->cond) (void)genExpr(*fs->cond);
+      else emit(OpCode::PUSH_INT, 1);
 
       std::size_t jOut = emitPlaceholder(OpCode::JMP_IF_FALSE);
       genStmt(*fs->body);
       if (fs->post) {
-        genExpr(*fs->post);
+        (void)genExpr(*fs->post);
         emit(OpCode::POP);
       }
       emit(OpCode::JMP, static_cast<std::int64_t>(condPos));
@@ -150,64 +177,89 @@ private:
     throw std::runtime_error("unknown stmt node");
   }
 
-  void genExpr(const Expr &e) {
+  TypeKind genExpr(const Expr &e) {
     if (const auto *n = dynamic_cast<const NumberExpr*>(&e)) {
-      emit(OpCode::PUSH_CONST, n->value);
-      return;
+      if (n->kind == TypeKind::Float) {
+        emit(OpCode::PUSH_FLOAT, internFloat(n->fValue));
+        return TypeKind::Float;
+      }
+      emit(OpCode::PUSH_INT, n->iValue);
+      return TypeKind::Int;
     }
     if (const auto *v = dynamic_cast<const VarExpr*>(&e)) {
-      std::int64_t slot = lookupVar(v->name);
-      emit(OpCode::LOAD, slot);
-      return;
+      VarInfo vi = lookupVar(v->name, v->pos);
+      emit(OpCode::LOAD, vi.slot);
+      return vi.type;
     }
     if (const auto *u = dynamic_cast<const UnaryExpr*>(&e)) {
       if (u->op == UnOp::Neg) {
-        genExpr(*u->expr);
+        TypeKind t = genExpr(*u->expr);
         emit(OpCode::NEG);
-        return;
+        return t;
       }
       if (u->op == UnOp::Not) {
-        genExpr(*u->expr);
+        (void)genExpr(*u->expr);
         emit(OpCode::NOT);
-        return;
+        return TypeKind::Int;
       }
       if (u->op == UnOp::PreInc || u->op == UnOp::PreDec) {
         const auto *v2 = dynamic_cast<const VarExpr*>(u->expr.get());
-        if (!v2) throw std::runtime_error("pre ++/-- requires a variable");
-        std::int64_t slot = lookupVar(v2->name);
-        emit(OpCode::LOAD, slot);
-        emit(OpCode::PUSH_CONST, (u->op == UnOp::PreInc) ? 1 : -1);
+        if (!v2) {
+          throw std::runtime_error("Semantic error at line " + std::to_string(u->pos) +
+                                   ": pre ++/-- requires a variable");
+        }
+        VarInfo vi = lookupVar(v2->name, v2->pos);
+        emit(OpCode::LOAD, vi.slot);
+        if (vi.type == TypeKind::Float) emit(OpCode::PUSH_FLOAT, internFloat((u->op == UnOp::PreInc) ? 1.0 : -1.0));
+        else emit(OpCode::PUSH_INT, (u->op == UnOp::PreInc) ? 1 : -1);
         emit(OpCode::ADD);
         emit(OpCode::DUP);         // keep result as expression value
-        emit(OpCode::STORE, slot); // store consumes one copy
-        return;
+        emit(OpCode::STORE, vi.slot); // store consumes one copy
+        return vi.type;
       }
     }
     if (const auto *p = dynamic_cast<const PostfixExpr*>(&e)) {
       const auto *v = dynamic_cast<const VarExpr*>(p->expr.get());
-      if (!v) throw std::runtime_error("post ++/-- requires a variable");
-      std::int64_t slot = lookupVar(v->name);
-      emit(OpCode::LOAD, slot); // old
+      if (!v) {
+        throw std::runtime_error("Semantic error at line " + std::to_string(p->pos) +
+                                 ": post ++/-- requires a variable");
+      }
+      VarInfo vi = lookupVar(v->name, v->pos);
+      emit(OpCode::LOAD, vi.slot); // old
       emit(OpCode::DUP);        // keep old as expression value
-      emit(OpCode::PUSH_CONST, (p->op == PostOp::PostInc) ? 1 : -1);
+      if (vi.type == TypeKind::Float) emit(OpCode::PUSH_FLOAT, internFloat((p->op == PostOp::PostInc) ? 1.0 : -1.0));
+      else emit(OpCode::PUSH_INT, (p->op == PostOp::PostInc) ? 1 : -1);
       emit(OpCode::ADD);        // new
-      emit(OpCode::STORE, slot);
-      return;
+      emit(OpCode::STORE, vi.slot);
+      return vi.type;
     }
     if (const auto *b = dynamic_cast<const BinaryExpr*>(&e)) {
       if (b->op == BinOp::Assign) {
         const auto *lv = dynamic_cast<const VarExpr*>(b->lhs.get());
-        if (!lv) throw std::runtime_error("left side of assignment must be a variable");
-        std::int64_t slot = lookupVar(lv->name);
-        genExpr(*b->rhs);
+        if (!lv) {
+          throw std::runtime_error("Semantic error at line " + std::to_string(b->pos) +
+                                   ": left side of assignment must be a variable");
+        }
+        VarInfo vi = lookupVar(lv->name, lv->pos);
+        TypeKind rhsT = genExpr(*b->rhs);
+        if (vi.type == TypeKind::Float && rhsT == TypeKind::Int) emit(OpCode::I2F);
+        if (vi.type == TypeKind::Int && rhsT == TypeKind::Float) {
+          typeError(b->pos, "cannot assign float expression to int variable '" + lv->name + "'");
+        }
         emit(OpCode::DUP);        // assignment expression evaluates to assigned value
-        emit(OpCode::STORE, slot);
-        return;
+        emit(OpCode::STORE, vi.slot);
+        return vi.type;
       }
 
       // For this mini-compiler, && and || are not short-circuiting.
-      genExpr(*b->lhs);
-      genExpr(*b->rhs);
+      TypeKind lt = genExpr(*b->lhs);
+      TypeKind rt = genExpr(*b->rhs);
+      const bool isFloat = (lt == TypeKind::Float) || (rt == TypeKind::Float);
+      if (isFloat && b->op == BinOp::Mod) {
+        typeError(b->pos, "operator % is only valid for int operands");
+      }
+      if (isFloat && lt == TypeKind::Int) emit(OpCode::I2F);
+      if (isFloat && rt == TypeKind::Int) emit(OpCode::I2F);
       switch (b->op) {
         case BinOp::Add: emit(OpCode::ADD); break;
         case BinOp::Sub: emit(OpCode::SUB); break;
@@ -226,15 +278,26 @@ private:
         case BinOp::Or:  emit(OpCode::OR);  break;
         case BinOp::Assign: break;
       }
-      return;
+      switch (b->op) {
+        case BinOp::Lt: case BinOp::Le: case BinOp::Gt: case BinOp::Ge:
+        case BinOp::Eq: case BinOp::Ne: case BinOp::And: case BinOp::Or:
+          return TypeKind::Int;
+        case BinOp::Add: case BinOp::Sub: case BinOp::Mul: case BinOp::Div:
+          return isFloat ? TypeKind::Float : TypeKind::Int;
+        case BinOp::Mod:
+          return TypeKind::Int;
+        case BinOp::Assign:
+          return TypeKind::Int;
+      }
     }
     throw std::runtime_error("unknown expr node");
   }
 
   std::vector<Instr> code_;
-  std::vector<std::unordered_map<std::string, std::int64_t>> scopes_;
+  std::vector<std::unordered_map<std::string, VarInfo>> scopes_;
   std::size_t nextSlot_ = 0;
   std::vector<std::string> strings_;
   std::unordered_map<std::string, std::int64_t> strIndex_;
+  std::vector<double> floatConsts_;
 };
 
